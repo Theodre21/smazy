@@ -1,0 +1,14 @@
+{
+  "name": "smazy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Smazy — study together. Hackathon demo prototype.",
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,magenta \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
+    "install:all": "npm install && npm --prefix server install && npm --prefix client install",
+    "build": "npm --prefix client run build"
+  },
+  "devDependencies": {
+    "concurrently": "9.1.0"
+  }
+}
