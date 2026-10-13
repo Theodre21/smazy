@@ -26,7 +26,7 @@ export function findFirstLecture(files: CourseFile[]) {
   })
 }
 
-export type ChatContext = { files: string[]; fileName?: string; page?: number; slideText?: string; fileText?: string }
+export type ChatContext = { files: string[]; fileName?: string; page?: number; slideText?: string; fileText?: string; partnerName?: string }
 
 // Streams the reply; onText receives the full text so far.
 export type AnswerStyle = 'quick' | 'deep'

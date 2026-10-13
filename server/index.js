@@ -21,6 +21,7 @@ refreshEnv()
 const { ALL_CATEGORIES, LEARN, PRACTICE, buildLinks, classifyAll, findFirstLecture, groupOf } = await import('./classify.js')
 const { askJson, describeError, provider, streamChat } = await import('./ai.js')
 const { CONVERTIBLE, canConvert, convertToPdf } = await import('./convert.js')
+const { browse } = await import('./browse.js')
 
 const app = express()
 const port = Number(process.env.PORT || 8787)
@@ -36,6 +37,9 @@ app.get('/api/health', async (_req, res) => {
 })
 
 // PowerPoint / Word -> PDF, so every lecture can be shown as slides.
+// The in-app browser (G then B) loads web pages through here.
+app.get('/api/browse', browse)
+
 app.post('/api/convert', express.raw({ type: () => true, limit: '300mb' }), async (req, res) => {
   const fileName = decodeURIComponent(String(req.get('x-file-name') || 'file.pptx'))
   if (!CONVERTIBLE.test(fileName)) return res.status(415).json({ error: 'This file type can’t be shown as slides.' })
@@ -234,7 +238,7 @@ kind = what sort of question it is:
   }
 })
 
-// Generic chat assistant, streamed as plain text chunks.
+// The Study Partner's replies, streamed as plain text chunks.
 app.post('/api/chat', async (req, res) => {
   const messages = Array.isArray(req.body?.messages) ? req.body.messages.filter((m) => (m.role === 'user' || m.role === 'assistant') && String(m.content || '').trim()) : []
   if (!messages.length || messages.at(-1).role !== 'user') return res.status(400).json({ error: 'Send a message first.' })
@@ -257,7 +261,12 @@ app.post('/api/chat', async (req, res) => {
     return res.end()
   }
 
-  const system = `You are Smazy, a friendly, knowledgeable AI assistant, the same kind of general-purpose assistant as Claude or ChatGPT. Help with anything the student asks: explanations, math, writing, coding, planning, or casual conversation. Answer in clear Markdown.
+  const partnerName = String(context.partnerName || 'Sam').replace(/[^\p{L}\p{N} .'-]/gu, '').trim().slice(0, 20) || 'Sam'
+  const system = `You are ${partnerName}, the student's study partner inside Smazy: the classmate who has already read every course file and is studying this slide alongside them.
+
+HOW YOU TALK: like a friendly classmate, not a tutor or a help desk. Use "I" and "we", plain everyday words, and a warm, relaxed tone. Get straight to the point; no formal openings such as "Certainly" or "Great question". When you are not sure, say so the way a classmate would ("I think it's this, but check the slide"). Do not describe yourself as an assistant, a chatbot or a language model. If the student sincerely asks whether you are a person or an AI, tell the truth: you are an AI study partner.
+
+You can help with anything the student asks: explanations, math, writing, coding, planning, or just talking. Answer in clear Markdown.
 
 ANSWER LENGTH for this reply: ${deep
     ? 'DEEP. Give the full explanation: build it up step by step, include one concrete example, and finish with a one-line takeaway. Use short headings or bullets so it is easy to scan.'

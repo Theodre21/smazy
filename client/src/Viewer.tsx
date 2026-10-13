@@ -1,3 +1,5 @@
+import { BrowserLayer } from './Browser'
+import { Companion, praise, usePartnerName } from './partner'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CONVERTIBLE, makeViewable } from './api'
 import { ChatPanel } from './Chat'
@@ -19,6 +21,7 @@ type Props = {
 }
 
 type PdfDocument = Awaited<ReturnType<typeof pdfjsLib.getDocument>['promise']>
+type PdfPage = Awaited<ReturnType<PdfDocument['getPage']>>
 const shortName = (name: string) => name.replace(/\.[a-z0-9]+$/i, '')
 
 // "K then a letter" opens the first file of a Course Info category.
@@ -37,6 +40,9 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [chatOpen, setChatOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
+  const partnerName = usePartnerName()
+  const [browserOpen, setBrowserOpen] = useState(false)
+  const [browserUsed, setBrowserUsed] = useState(false)
   const [categoryArmed, setCategoryArmed] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [firstPrompt, setFirstPrompt] = useState<'ask' | 'pick' | 'done'>('ask')
@@ -71,6 +77,8 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
   // In full screen the tools stay hidden until the cursor moves to the top edge, like Preview.
   const [toolsShown, setToolsShown] = useState(false)
   const [pageHeight, setPageHeight] = useState(540)
+  const [webLinks, setWebLinks] = useState<WebLink[]>([])
+  const [browserRequest, setBrowserRequest] = useState<{ url: string; id: number } | null>(null)
   // Linked slides: L starts typing "lecture slide", J follows a link, B goes back to where you were.
   const [linkEntry, setLinkEntry] = useState<string | null>(null)
   const [pickingLink, setPickingLink] = useState(false)
@@ -160,6 +168,8 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
         shownSlide.current = slideKey
         window.clearTimeout(slowTimer)
         setRendering(false)
+        // Web addresses on the slide become clickable and open in Smazy's own browser.
+        void findWebLinks(pdfPage, base.width, base.height).then((found) => { if (!cancelled) setWebLinks(found) }).catch(() => {})
         // Invisible, selectable text on top of the slide: lets you select and highlight words.
         const textLayer = textLayerRef.current
         if (textLayer) {
@@ -295,6 +305,44 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
     return () => document.removeEventListener('fullscreenchange', onChange)
   }, [])
 
+  // The study partner notices good study habits. It waits until the student has paused, then looks at what was added.
+  const noticed = useRef<{ key: string; highlights: number; ink: number; notes: number; links: number } | null>(null)
+  useEffect(() => {
+    if (!current?.isPdf || reasonFor) return
+    const key = `${current.path}#${page}`
+    const links = markup.filter((item) => item.kind === 'link')
+    const now = {
+      key,
+      highlights: markup.filter((item) => item.kind === 'highlight' || (item.kind === 'ink' && item.marker)).length,
+      ink: markup.filter((item) => item.kind === 'ink' && !item.marker).length,
+      notes: markup.filter((item) => item.kind === 'text' && item.text.trim().length > 2).length,
+      links: links.length,
+    }
+    if (noticed.current?.key !== key) { noticed.current = now; return }
+    const timer = window.setTimeout(() => {
+      const before = noticed.current
+      noticed.current = now
+      if (!before || before.key !== key) return
+      const newest = links.at(-1)
+      if (now.links > before.links && newest?.kind === 'link') praise({ kind: 'link', where: newest.label, withReason: Boolean(newest.reason?.trim()) })
+      else if (now.notes > before.notes) praise({ kind: 'note' })
+      else if (now.highlights > before.highlights) praise({ kind: 'highlight', count: now.highlights })
+      else if (now.ink > before.ink) praise({ kind: 'ink' })
+    }, 1600)
+    return () => window.clearTimeout(timer)
+  }, [markup, current, page, reasonFor])
+
+  // Reaching the last slide of a lecture by going through it is worth a word too.
+  const lastPage = useRef({ path: '', page: 0 })
+  useEffect(() => {
+    if (!current) return
+    const before = lastPage.current
+    lastPage.current = { path: current.path, page }
+    if (current.category === 'Lecture' && current.isPdf && pageCount > 3 && page === pageCount && before.path === current.path && before.page === pageCount - 1) {
+      praise({ kind: 'finished', where: current.lectureNumber != null ? `Lecture ${current.lectureNumber}` : shortName(current.name) })
+    }
+  }, [current, page, pageCount])
+
   // Downloads the open lecture as a PDF with every highlight, drawing and text box included.
   const downloadWithMarkup = useCallback(async () => {
     if (!current?.isPdf || downloading) return
@@ -303,6 +351,7 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
       const pages = markupForFile(current.path)
       const count = Object.values(pages).reduce((total, list) => total + list.length, 0)
       saveBlob(await exportWithMarkup(current.file, pages), `${shortName(current.name)} (Smazy notes).pdf`)
+      praise({ kind: 'download', count })
       setNotice(count ? `Downloaded with ${count} note${count === 1 ? '' : 's'} and highlight${count === 1 ? '' : 's'}` : 'Downloaded (no markup on this file yet)')
     } catch (error) {
       console.error(error)
@@ -315,6 +364,17 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
   const closeChat = useCallback(() => {
     chatInputRef.current?.blur()
     setChatOpen(false)
+  }, [])
+
+  const openInBrowser = useCallback((url: string) => {
+    setBrowserUsed(true)
+    setBrowserOpen(true)
+    setBrowserRequest({ url, id: Date.now() })
+  }, [])
+
+  const toggleBrowser = useCallback(() => {
+    setBrowserUsed(true)
+    setBrowserOpen((v) => !v)
   }, [])
 
   const openChat = useCallback(() => {
@@ -333,8 +393,11 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
       if (markupCombo && event.code === 'KeyH') { event.preventDefault(); if (!highlightSelection()) setTool(tool === 'highlight' ? 'select' : 'highlight'); return }
       if (markupCombo && event.code === 'KeyP') { event.preventDefault(); setTool(tool === 'pen' ? 'select' : 'pen'); return }
       if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 'z' && !typing) { event.preventDefault(); undoMarkup(); return }
+      // ⌘` (Ctrl+` on Windows) leaves the browser, even from its address bar.
+      if (browserOpen && (event.metaKey || event.ctrlKey) && event.code === 'Backquote') { event.preventDefault(); setBrowserOpen(false); return }
       if (event.key === 'Escape') {
         if (helpOpen) setHelpOpen(false)
+        else if (browserOpen) { /* Esc belongs to the web page; ⌘` closes the browser */ }
         else if (reasonFor) { setReasonFor(null); setNotice(`Linked to ${reasonFor.label}. Press J to jump there`) }
         else if (linkEntry !== null || pickingLink) { setLinkEntry(null); setPickingLink(false) }
         else if (categoryArmed || jumpBuffer !== null) { setCategoryArmed(false); setJumpBuffer(null) }
@@ -344,6 +407,14 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
         return
       }
       if (typing || event.metaKey || event.ctrlKey || event.altKey) return
+      // "G then B" opens and closes the browser. While it covers the slide, the slide keys rest.
+      if (jumpBuffer === '' && event.key.toLowerCase() === 'b') { event.preventDefault(); setJumpBuffer(null); toggleBrowser(); return }
+      if (browserOpen) {
+        if (event.key.toLowerCase() === 'g') setJumpBuffer('')
+        else if (event.key === '/') { event.preventDefault(); if (chatOpen) closeChat(); else openChat() }
+        else if (event.key === '?') setHelpOpen((v) => !v)
+        return
+      }
       // Typing a link: digits, one space between lecture and slide, Enter to add.
       if (linkEntry !== null) {
         event.preventDefault()
@@ -352,6 +423,8 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
         else if (event.key === ' ' && /^\d+$/.test(linkEntry)) setLinkEntry(`${linkEntry} `)
         else if (event.key === 'Backspace') setLinkEntry(linkEntry.slice(0, -1))
         else if (event.key === 'Enter') { if (addLink(linkEntry)) setLinkEntry(null) }
+        // L again cancels, the same key that started it.
+        else if (event.key.toLowerCase() === 'l') { setLinkEntry(null); setNotice(null) }
         return
       }
       if (pickingLink) {
@@ -394,7 +467,7 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [addTextBox, categoryArmed, changePage, chatOpen, helpOpen, highlightSelection, jumpBuffer, jumpToCategory, openChat, setTool, stepInCategory, toggleFullscreen, tool, undoMarkup, addLink, current, followLink, goBack, linkEntry, pickingLink, returnStack.length, slideLinks, reasonFor])
+  }, [addTextBox, categoryArmed, changePage, chatOpen, helpOpen, highlightSelection, jumpBuffer, jumpToCategory, openChat, setTool, stepInCategory, toggleFullscreen, tool, undoMarkup, addLink, current, followLink, goBack, linkEntry, pickingLink, returnStack.length, slideLinks, reasonFor, browserOpen, toggleBrowser, closeChat])
 
   // K waits briefly for its letter; notices fade on their own.
   useEffect(() => {
@@ -464,7 +537,9 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
         // Judged by position, because once the bar is showing it covers the top of the chat.
         const chatLeft = chatOpen ? event.currentTarget.querySelector('.chat-panel')?.getBoundingClientRect().left : undefined
         const overChat = chatLeft !== undefined && event.clientX >= chatLeft
-        const show = !overChat && event.clientY < (toolsShown ? 132 : 44)
+        // The study partner sits in the top-right corner: reaching for it shouldn't pull the tools down over it.
+        const overPartner = !chatOpen && !toolsShown && event.clientX > window.innerWidth - 130
+        const show = !overChat && !overPartner && !browserOpen && event.clientY < (toolsShown ? 132 : 44)
         if (show !== toolsShown) setToolsShown(show)
       } : undefined}
     >
@@ -482,8 +557,9 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
         <div className="topbar-right">
           {current.isPdf && <button className="quiet-button" onClick={() => void downloadWithMarkup()} disabled={downloading} title="Download this file as a PDF with your highlights, drawings and text boxes">{downloading ? 'Preparing…' : '⤓ Download'}</button>}
           <button className={`quiet-button ${fullscreen ? 'active' : ''}`} onClick={toggleFullscreen} title="Full screen (F)">{fullscreen ? 'Exit full screen' : 'Full screen'} <kbd>F</kbd></button>
+          <button className={`quiet-button ${browserOpen ? 'active' : ''}`} onClick={toggleBrowser} title="Search the web without leaving Smazy (G then B)">Browser <kbd>G</kbd> <kbd>B</kbd></button>
           <button className={`quiet-button ${helpOpen ? 'active' : ''}`} onClick={() => setHelpOpen((v) => !v)}>Shortcuts <kbd>?</kbd></button>
-          <button className={`quiet-button ${chatOpen ? 'active' : ''}`} onClick={() => (chatOpen ? closeChat() : openChat())}>✦ Chat <kbd>/</kbd></button>
+          <button className={`quiet-button ${chatOpen ? 'active' : ''}`} onClick={() => (chatOpen ? closeChat() : openChat())} title={`Talk to ${partnerName}, your study partner`}>Study Partner <kbd>/</kbd></button>
         </div>
       </header>
 
@@ -555,6 +631,16 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
             <>
               <canvas ref={canvasRef} className={rendering ? 'loading' : ''} />
               <div ref={textLayerRef} className={`textLayer ${tool === 'select' || tool === 'highlight' ? '' : 'inactive'} ${tool === 'highlight' ? 'highlighting-text' : ''}`} />
+              {tool === 'select' && shownSlide.current === `${current.path}#${page}` && webLinks.map((link, index) => (
+                <a
+                  key={index}
+                  className="web-link"
+                  href={link.url}
+                  title={`Open in the Smazy browser: ${link.url}`}
+                  style={{ left: `${link.x * 100}%`, top: `${link.y * 100}%`, width: `${link.w * 100}%`, height: `${link.h * 100}%` }}
+                  onClick={(event) => { event.preventDefault(); openInBrowser(link.url) }}
+                />
+              ))}
               <MarkupLayer
                 key={`${current.path}#${page}`}
                 annotations={markup}
@@ -621,8 +707,8 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
         {current.isPdf && (
           <MarkupToolbar tool={tool} setTool={setTool} color={markupColor} setColor={setMarkupColor} onUndo={undoMarkup} onClear={() => setMarkup(() => [])} canUndo={markup.length > 0} />
         )}
-        {!chatOpen && <button className="ask-fab" onClick={openChat} title={savedQuestions ? 'This slide has a saved conversation' : undefined}>✦ Ask Smazy{savedQuestions > 0 && <span className="fab-count">💬 {savedQuestions}</span>} <kbd>/</kbd></button>}
-        {jumpBuffer !== null && <div className="jump-toast">Go to lecture <b>{jumpBuffer || '…'}</b></div>}
+        {!chatOpen && <Companion name={partnerName} slideKey={`${current.path}#${page}`} earlier={savedQuestions} onOpen={openChat} />}
+        {jumpBuffer !== null && <div className="jump-toast">Go to lecture <b>{jumpBuffer || '…'}</b>{!jumpBuffer && <span className="toast-hint"> · <kbd>B</kbd> browser</span>}</div>}
         {linkEntry !== null && (
           <div className="jump-toast category-toast">
             <span>Link this slide to</span>
@@ -630,7 +716,7 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
             <span>slide <kbd>{linkEntry.includes(' ') ? linkEntry.split(' ')[1] || '…' : '…'}</kbd></span>
             {notice
               ? <span className="toast-error">{notice}</span>
-              : <span className="toast-hint">{linkEntry.includes(' ') ? 'Enter to add' : 'Space, then the slide number'} · Esc cancels</span>}
+              : <span className="toast-hint">{linkEntry.includes(' ') ? 'Enter to add' : 'Space, then the slide number'} · L or Esc cancels</span>}
           </div>
         )}
         {pickingLink && (
@@ -673,11 +759,46 @@ export function Viewer({ files, setFiles, links, first, onReset }: Props) {
         {notice && !categoryArmed && jumpBuffer === null && linkEntry === null && !pickingLink && !reasonFor && <div className="jump-toast">{notice}</div>}
       </main>
 
-      <ChatPanel open={chatOpen} onClose={closeChat} inputRef={chatInputRef} getContext={getContext} location={current.isPdf || isSheet ? { path: current.path, fileName: shortName(current.name), page, unit: isSheet ? 'sheet' : 'slide' } : null} courseFiles={courseFiles} />
+      {browserUsed && <BrowserLayer open={browserOpen} onClose={() => setBrowserOpen(false)} request={browserRequest} />}
+
+      <ChatPanel open={chatOpen} onClose={closeChat} inputRef={chatInputRef} getContext={getContext} location={current.isPdf || isSheet ? { path: current.path, fileName: shortName(current.name), page, unit: isSheet ? 'sheet' : 'slide' } : null} courseFiles={courseFiles} onOpenLink={openInBrowser} />
 
       {helpOpen && <ShortcutsGuide onClose={() => setHelpOpen(false)} />}
     </div>
   )
+}
+
+// Web addresses on a slide, as fractions of the page: real PDF hyperlinks first, then addresses that are only typed out.
+type WebLink = { url: string; x: number; y: number; w: number; h: number }
+const WEB_ADDRESS = /(?:https?:\/\/|www\.)[^\s<>"'()]+/gi
+async function findWebLinks(pdfPage: PdfPage, pageWidth: number, pageHeight: number): Promise<WebLink[]> {
+  const viewport = pdfPage.getViewport({ scale: 1 })
+  const place = (url: string, rect: number[]): WebLink => {
+    const [x1, y1, x2, y2] = viewport.convertToViewportRectangle(rect)
+    return { url, x: Math.min(x1, x2) / pageWidth, y: Math.min(y1, y2) / pageHeight, w: Math.abs(x2 - x1) / pageWidth, h: Math.abs(y2 - y1) / pageHeight }
+  }
+  const links: WebLink[] = []
+  for (const note of await pdfPage.getAnnotations()) {
+    const url = note.subtype === 'Link' ? (note.url || note.unsafeUrl) : undefined
+    if (typeof url === 'string' && /^https?:\/\//i.test(url) && Array.isArray(note.rect)) links.push(place(url, note.rect))
+  }
+  const covered = (link: WebLink) => links.some((other) => link.x + link.w / 2 >= other.x && link.x + link.w / 2 <= other.x + other.w && link.y + link.h / 2 >= other.y && link.y + link.h / 2 <= other.y + other.h)
+  const text = await pdfPage.getTextContent()
+  for (const item of text.items) {
+    if (!('str' in item) || !item.str || !item.width) continue
+    for (const match of item.str.matchAll(WEB_ADDRESS)) {
+      const address = match[0].replace(/[.,;:!?\]]+$/, '')
+      if (address.length < 8 && !address.includes('.')) continue
+      // Position within the line of text, by share of its characters.
+      const from = (match.index || 0) / item.str.length
+      const share = address.length / item.str.length
+      const [, , , , x, y] = item.transform
+      const height = item.height || 10
+      const link = place(/^www\./i.test(address) ? `https://${address}` : address, [x + item.width * from, y - height * 0.2, x + item.width * (from + share), y + height])
+      if (!covered(link)) links.push(link)
+    }
+  }
+  return links
 }
 
 // Small picture of another slide, shown when hovering over a link note.
@@ -713,10 +834,10 @@ function ShortcutsGuide({ onClose }: { onClose: () => void }) {
   const sections: Array<{ title: string; rows: Array<[string[], string]> }> = [
     { title: 'Slides', rows: [[['←', '→'], 'Previous / next slide'], [['Space'], 'Next slide'], [['G', '2'], 'Go to Lecture 2 (any number)'], [['`'], 'Show / hide the course files (top left)']] },
     { title: 'Course Info', rows: CATEGORY_KEYS.map((item) => [['K', item.key.toUpperCase()], `Open ${item.label}${item.key === 'b' ? ' (references)' : ''}`] as [string[], string]).concat([[['Shift', '→'], 'Next document in the same category'], [['Shift', '←'], 'Previous document in the same category']]) },
-    { title: 'Linked slides (lectures)', rows: [[['L', '1', 'Space', '12', '↵'], 'Link this slide to Lecture 1, slide 12'], [['J'], 'Jump to the linked slide and see your note on it'], [['J'], 'Press again to come back (or B / Esc)']] },
+    { title: 'Linked slides (lectures)', rows: [[['L', '1', 'Space', '12', '↵'], 'Link this slide to Lecture 1, slide 12'], [['L'], 'Press L again to cancel a link you’ve started'], [['J'], 'Jump to the linked slide and see your note on it'], [['J'], 'Press again to come back (or B / Esc)']] },
     { title: 'Markup', rows: [[['⌃', '⌘', 'T'], 'Add a text box'], [['⌃', '⌘', 'H'], 'Highlight selected text'], [['⌃', '⌘', 'P'], 'Pen on / off'], [['⌘', 'Z'], 'Undo last markup'], [['Esc'], 'Back to the pointer']] },
-    { title: 'Chat', rows: [[['/'], 'Open / close the chat (types a slash once you’ve started a message)'], [['Tab'], 'In the chat: conversation ↔ this slide’s history tree'], [['Enter'], 'Choose the answer length, then Enter again to send'], [['←', '→'], 'Quick (key point) / Deep (full explanation)'], [['Shift', 'Enter'], 'New line']] },
-    { title: 'General', rows: [[['F'], 'Full screen on / off'], [['?'], 'Show / hide this guide'], [['Esc'], 'Close']] },
+    { title: 'Study Partner', rows: [[['/'], 'Open / close your study partner (types a slash once you’ve started a message)'], [['Tab'], 'With your study partner: conversation ↔ this slide’s history tree'], [['Enter'], 'Choose the answer length, then Enter again to send'], [['←', '→'], 'Quick (key point) / Deep (full explanation)'], [['Shift', 'Enter'], 'New line']] },
+    { title: 'General', rows: [[['F'], 'Full screen on / off'], [['G', 'B'], 'Open the web browser'], [['⌘', '`'], 'Close the web browser and return to your slide'], [['?'], 'Show / hide this guide'], [['Esc'], 'Close']] },
   ]
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
@@ -738,7 +859,7 @@ function ShortcutsGuide({ onClose }: { onClose: () => void }) {
             </section>
           ))}
         </div>
-        <footer>Single-key shortcuts pause while you type in the chat or a text box. On Windows, use Ctrl+Alt in place of ⌃⌘.</footer>
+        <footer>Single-key shortcuts pause while you type to your study partner or in a text box. On Windows, use Ctrl+Alt in place of ⌃⌘.</footer>
       </div>
     </div>
   )

@@ -4,15 +4,29 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { health, placeQuestion, streamChat } from './api'
 import type { AnswerStyle, ChatContext, ChatStatus } from './api'
-import { depthOf, threadKey, updateThread, useThreads } from './threads'
+import { threadKey, updateThread, useThreads } from './threads'
 import type { Turn } from './threads'
 import { useDictation, useReadAloud } from './Voice'
 import { HistoryTree } from './HistoryTree'
+import { PartnerAvatar, PartnerCustomizer, usePartnerName } from './partner'
 
-const SUGGESTIONS = ['Explain this slide like I’m new to it', 'Quiz me on this slide', 'Summarize this lecture in 5 bullets', 'What should I know before the exam?']
+const SUGGESTIONS = ['I don’t get this slide. Can you walk me through it?', 'Quiz me on this slide', 'What’s the main point of this lecture?', 'What should I know before the exam?']
 const firstWords = (text: string) => {
   const words = text.replace(/[?.!]+$/, '').split(/\s+/)
   return words.slice(0, 6).join(' ') + (words.length > 6 ? '…' : '')
+}
+
+// Short replies arrive as a few separate messages, the way a friend texts. Long explanations stay in one piece.
+const asMessages = (answer: string, style?: string) => {
+  if (!answer.trim()) return []
+  if (style === 'deep' || answer.includes('```') || /^\s*\|/m.test(answer)) return [answer]
+  const parts = answer.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean)
+  return parts.length > 4 ? [...parts.slice(0, 3), parts.slice(3).join('\n\n')] : parts
+}
+const timeLabel = (when: number) => {
+  const date = new Date(when)
+  const time = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  return date.toDateString() === new Date().toDateString() ? `Today ${time}` : `${date.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${time}`
 }
 
 type Props = {
@@ -24,9 +38,10 @@ type Props = {
   location: { path: string; fileName: string; page: number; unit?: string } | null
   // Files of the open course, used to label the history (e.g. "Lecture 3 · L3_students").
   courseFiles: Array<{ path: string; label: string }>
+  onOpenLink?: (url: string) => void
 }
 
-export function ChatPanel({ open, onClose, inputRef, getContext, location, courseFiles }: Props) {
+export function ChatPanel({ open, onClose, inputRef, getContext, location, courseFiles, onOpenLink }: Props) {
   const threads = useThreads()
   const [view, setView] = useState<'chat' | 'history'>('chat')
   const [draft, setDraft] = useState('')
@@ -40,6 +55,9 @@ export function ChatPanel({ open, onClose, inputRef, getContext, location, cours
   const scrollRef = useRef<HTMLDivElement>(null)
   const dictation = useDictation(setDraft)
   const readAloud = useReadAloud()
+  const name = usePartnerName()
+  // The student can name their study partner and choose how it looks.
+  const [customizing, setCustomizing] = useState(false)
 
   const unit = location?.unit || 'slide'
   const key = location ? threadKey(location.path, location.page) : ''
@@ -108,7 +126,7 @@ export function ChatPanel({ open, onClose, inputRef, getContext, location, cours
     let received = ''
     const setReply = (answer: string) => { received = answer; edit((item) => ({ ...item, answer })) }
     try {
-      await streamChat(history, getContext(), setReply, controller.signal, style)
+      await streamChat(history, { ...getContext(), partnerName: name }, setReply, controller.signal, style)
     } catch (error) {
       if (!controller.signal.aborted) setReply(`_Couldn’t get a reply: ${(error as Error).message}. Is the Smazy server running?_`)
       // Stopped (or the slide changed) before any text arrived: don't leave the answer loading forever.
@@ -141,9 +159,18 @@ export function ChatPanel({ open, onClose, inputRef, getContext, location, cours
       }}
     >
       <header className="chat-header">
+        <div className="partner-row">
+          <button className="partner-face" onClick={() => setCustomizing(true)} title="Customize your study partner"><PartnerAvatar name={name} online={Boolean(status && status !== 'unknown')} /></button>
+          <div className="partner-id">
+            <button className="partner-name" onClick={() => setCustomizing(true)} title="Name and customize your study partner">{name}<span>✎</span></button>
+            <small className={streaming ? 'typing-now' : ''}>{streaming ? 'typing…' : location ? `Your study partner · on ${unit} ${location.page} with you` : 'Your study partner'}</small>
+          </div>
+          <button className="icon-button" onClick={onClose} title="Close (/ or Esc)">×</button>
+        </div>
+        <div className="partner-tabs-row">
         <div className="chat-tabs" role="tablist">
           <button role="tab" aria-selected={view === 'chat'} className={view === 'chat' ? 'active' : ''} onClick={showChat}>
-            {location ? `This ${unit}` : 'Chat'}{turns.length > 0 && <b>{turns.length}</b>}
+            {location ? `This ${unit}` : 'Talk'}{turns.length > 0 && <b>{turns.length}</b>}
           </button>
           <button role="tab" aria-selected={view === 'history'} className={view === 'history' ? 'active' : ''} onClick={showHistory} title={`This ${unit}’s questions as a tree (Tab)`}>
             History <kbd>Tab</kbd>
@@ -152,8 +179,6 @@ export function ChatPanel({ open, onClose, inputRef, getContext, location, cours
         <span className={`chat-status ${status && status !== 'unknown' ? 'live' : ''}`} title={status && status !== 'unknown' ? `${status.model} via ${status.via}` : 'No chat model connected: replies are samples'}>
           {status === 'unknown' ? '' : status ? status.label : 'Sample replies'}
         </span>
-        <div className="chat-header-actions">
-          <button className="icon-button" onClick={onClose} title="Close chat (/ or Esc)">×</button>
         </div>
       </header>
 
@@ -161,9 +186,9 @@ export function ChatPanel({ open, onClose, inputRef, getContext, location, cours
         <div className="chat-scroll history-view">
           {!slideThread ? (
             <div className="chat-empty">
-              <span className="chat-logo">✦</span>
+              <PartnerAvatar name={name} size="large" />
               <h2>No questions on this {unit} yet</h2>
-              <p>Ask something here and it’s kept with this {unit}. Its questions and follow-ups will be drawn here as a tree.</p>
+              <p>Ask {name} something here and it’s kept with this {unit}. Its questions and follow-ups will be drawn here as a tree.</p>
             </div>
           ) : (
             <section className="history-file">
@@ -176,42 +201,66 @@ export function ChatPanel({ open, onClose, inputRef, getContext, location, cours
         <>
           <div className="chat-scroll" ref={scrollRef}>
             {turns.length === 0 ? (
-              <div className="chat-empty">
-                <span className="chat-logo">✦</span>
-                <h2>How can I help?</h2>
-                <p>Ask about this {unit}. Your conversation is saved with it, so it’s here when you come back.</p>
+              <div className="dm-start">
+                <div className="dm-profile">
+                  <PartnerAvatar name={name} size="large" />
+                  <h2>{name}</h2>
+                  <p>Your study partner · <button className="customize-link" onClick={() => setCustomizing(true)}>Customize</button></p>
+                </div>
                 {status === null && (
                   <div className="connect-note">
-                    <strong>You’ll get sample replies until a chat model is connected.</strong>
+                    <strong>{name} gives sample replies until a model is connected.</strong>
                     <span>Free: open the Ollama app (and set <code>CHAT_PROVIDER=ollama</code> in <code>smazy/.env</code>).</span>
                     <span>Or Claude: add <code>ANTHROPIC_API_KEY=sk-ant-…</code> to <code>smazy/.env</code>. No restart needed.</span>
                   </div>
                 )}
+                {/* The partner speaks first, like a friend who messaged you. */}
+                <div className="message assistant intro">
+                  <PartnerAvatar name={name} size="small" />
+                  <div className="partner-says">
+                    <div className="bubble partner">Hey! 👋</div>
+                    <div className="bubble partner">{location ? `I’m on ${unit} ${location.page} with you, and I’ve read the course files.` : 'I’ve read your course files.'}</div>
+                    <div className="bubble partner">What are we stuck on?</div>
+                  </div>
+                </div>
                 {location && <div className="suggestions">{SUGGESTIONS.map((s) => <button key={s} onClick={() => void send(s)}>{s}</button>)}</div>}
               </div>
             ) : turns.map((turn, index) => {
               const parent = turn.parentId ? turns.find((item) => item.id === turn.parentId) : undefined
-              const depth = Math.min(3, depthOf(turn, turns))
-              const answering = streaming && index === turns.length - 1
+              const last = index === turns.length - 1
+              const answering = streaming && last
+              const before = turns[index - 1]
+              const messages = asMessages(turn.answer, turn.style)
               return (
-                <div key={turn.id} id={`turn-${turn.id}`} className={`turn ${depth ? 'branch' : ''}`} style={{ marginLeft: depth * 14 }}>
-                  {parent && <span className="branch-label" title={parent.question}>↳ Follow-up on “{parent.title}”</span>}
-                  <div className="message user"><div className="bubble">{turn.question}</div></div>
+                <div key={turn.id} id={`turn-${turn.id}`} className={`turn ${parent ? 'branch' : ''}`}>
+                  {(!before || turn.createdAt - before.createdAt > 10 * 60 * 1000) && <time className="chat-time">{timeLabel(turn.createdAt)}</time>}
+                  <div className="message user">
+                    {/* A follow-up is shown the way a messaging app shows a reply to an earlier message. */}
+                    {parent && <span className="branch-label" title={parent.question}>↩ Replying to “{parent.title}”</span>}
+                    <div className="bubble">{turn.question}</div>
+                    {last && <small className="receipt">{turn.answer ? 'Seen' : 'Delivered'}</small>}
+                  </div>
                   <div className="message assistant">
-                    <div className="markdown">
-                      {turn.answer ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.answer}</ReactMarkdown> : <span className="typing"><i /><i /><i /></span>}
+                    <PartnerAvatar name={name} size="small" />
+                    <div className="partner-says">
+                      {messages.length === 0 && <div className="bubble partner"><span className="typing" aria-label={`${name} is typing`}><i /><i /><i /></span></div>}
+                      {messages.map((message, part) => (
+                        <div key={part} className="bubble partner markdown">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer" title="Open in the Smazy browser" onClick={(event) => { if (onOpenLink && href && /^https?:\/\//i.test(href)) { event.preventDefault(); onOpenLink(href) } }}>{children}</a> }}>{message}</ReactMarkdown>
+                          {turn.saved && part === messages.length - 1 && <span className="bubble-reaction" title="Saved as important">★</span>}
+                        </div>
+                      ))}
+                      {turn.answer && !answering && (
+                        <div className={`message-actions ${last ? 'shown' : ''}`}>
+                          {turn.style === 'quick' && !streaming && !turns.some((item) => item.deepens === turn.id) && (
+                            <button className="go-deeper" onClick={() => void send('Go deeper', 'deep', { deepen: turn })} title="Get the full explanation of this answer">Go deeper →</button>
+                          )}
+                          <button className={`save-turn ${turn.saved ? 'saved' : ''}`} onClick={() => toggleSaved(turn)} aria-pressed={Boolean(turn.saved)} title={turn.saved ? 'Saved as important. Click to unsave' : 'Save this as important: it will stand out in History'}>{turn.saved ? '★ Saved' : '☆ Save'}</button>
+                          <button onClick={() => void navigator.clipboard?.writeText(turn.answer)}>Copy</button>
+                          {readAloud.supported && <button onClick={() => readAloud.toggle(index, turn.answer)} title={`Hear ${name} say this`}>{readAloud.speaking === index ? '■ Stop' : '🔊 Listen'}</button>}
+                        </div>
+                      )}
                     </div>
-                    {turn.answer && !answering && (
-                      <div className="message-actions">
-                        {turn.style && <span className={`style-tag ${turn.style}`}>{turn.style === 'deep' ? 'Deep' : 'Quick'}</span>}
-                        {turn.style === 'quick' && !streaming && !turns.some((item) => item.deepens === turn.id) && (
-                          <button className="go-deeper" onClick={() => void send('Go deeper', 'deep', { deepen: turn })} title="Get the full explanation of this answer">Go deeper →</button>
-                        )}
-                        <button className={`save-turn ${turn.saved ? 'saved' : ''}`} onClick={() => toggleSaved(turn)} aria-pressed={Boolean(turn.saved)} title={turn.saved ? 'Saved as important. Click to unsave' : 'Save this as important: it will stand out in History'}>{turn.saved ? '★ Saved' : '☆ Save'}</button>
-                        <button onClick={() => void navigator.clipboard?.writeText(turn.answer)}>Copy</button>
-                        {readAloud.supported && <button onClick={() => readAloud.toggle(index, turn.answer)} title="Read this answer aloud">{readAloud.speaking === index ? '■ Stop' : '🔊 Listen'}</button>}
-                      </div>
-                    )}
                   </div>
                 </div>
               )
@@ -241,7 +290,7 @@ export function ChatPanel({ open, onClose, inputRef, getContext, location, cours
                 rows={1}
                 value={draft}
                 disabled={!location}
-                placeholder={!location ? 'Open a slide to chat about it' : dictation.listening ? 'Listening… speak now' : 'Message Smazy…'}
+                placeholder={!location ? `Open a slide to study it with ${name}` : dictation.listening ? 'Listening… speak now' : `Message ${name}…`}
                 onChange={(event) => { setDraft(event.target.value); setChoosing(null) }}
                 onKeyDown={(event) => {
                   // Step 2 of sending: ← Quick / Deep →, Enter confirms, Esc goes back to editing.
@@ -274,10 +323,11 @@ export function ChatPanel({ open, onClose, inputRef, getContext, location, cours
             </div>
             {dictation.error
               ? <small className="composer-note voice-error" role="alert">{dictation.error}</small>
-              : <small className="composer-note">{choosing ? '← → to choose · Enter to send · Esc to edit' : dictation.listening ? 'Listening. Tap the mic to stop, then press Enter to send.' : 'Smazy can make mistakes. Check important info against your course files.'}</small>}
+              : <small className="composer-note">{choosing ? '← → to choose · Enter to send · Esc to edit' : dictation.listening ? 'Listening. Tap the mic to stop, then press Enter to send.' : `Like any classmate, ${name} can get things wrong. Check what matters against your course files.`}</small>}
           </form>
         </>
       )}
+      {customizing && <PartnerCustomizer onClose={() => { setCustomizing(false); window.setTimeout(() => inputRef.current?.focus(), 0) }} />}
     </aside>
   )
 }
